@@ -1,8 +1,12 @@
-﻿using UnityEngine;
+﻿/*NOT CURRENTLY USED as i could not get it working with Harmony. using SharpDX and Windows INPUT API to read Xbox controller state directly.
+ * 
+ * using UnityEngine;
 using HarmonyLib;
 using System.Reflection;
 using EFT.InputSystem;
 using EFT;
+using SharpDX.XInput;
+using SharpDX;
 
 namespace BeefyController
 {
@@ -15,4 +19,4 @@ namespace BeefyController
             Debug.Log("[XboxControllerMod] Initialized");
         }
     }
-}
+}*/

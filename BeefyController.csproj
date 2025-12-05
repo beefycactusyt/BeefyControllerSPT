@@ -89,6 +89,12 @@
 		<Reference Include="UnityEngine.CoreModule">
 			<HintPath>..\..\EscapeFromTarkov_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
 		</Reference>
+		<Reference Include="SharpDX.XInput">
+			<HintPath>SharpDX.XInput.dll</HintPath>
+		</Reference>
+		<Reference Include="SharpDX">
+			<HintPath>SharpDX.dll</HintPath>
+		</Reference>
 		<Reference Include="UnityEngine.IMGUIModule, Version=0.0.0.0, Culture=neutral, processorArchitecture=MSIL">
 			<SpecificVersion>False</SpecificVersion>
 			<HintPath>..\..\EscapeFromTarkov_Data\Managed\UnityEngine.IMGUIModule.dll</HintPath>
@@ -107,8 +113,6 @@
 	</ItemGroup>
 	<ItemGroup>
 		<Compile Include="BeefyControllerClass.cs" />
-		<Compile Include="Plugin.cs" />
-		<Compile Include="BeefyControllerAttributes.cs" />
 	</ItemGroup>
 	<Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 	<PropertyGroup>
