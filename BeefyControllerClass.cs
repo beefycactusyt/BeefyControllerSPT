@@ -1,235 +1,440 @@
 ﻿using System;
+using System.Collections.Generic;
 using BepInEx;
+using BepInEx.Logging;
 using HarmonyLib;
+using SharpDX.XInput;
 using UnityEngine;
-using EFT;
 using EFT.InputSystem;
 
-[BepInPlugin("com.beefy.spt.controller", "Beefy Controller", "1.0.0")]
-public class BeefyControllerClass : BaseUnityPlugin
+namespace BeefyController
 {
-    private Harmony _harmony;
-
-    private const float MoveDeadzone = 0.12f;
-    private const float LookDeadzone = 0.12f;
-    private const float MoveSensitivity = 1.0f;
-    private const float LookBaseSensitivity = 2.5f;   // overall look speed
-    private const float LookVerticalScale = 0.7f;     // vertical slower than horizontal
-
-    private void Awake()
+    [BepInPlugin("com.beefy.spt.controller", "Beefy InGame Controller", "2.3.0")]
+    public class BeefyControllerPlugin : BaseUnityPlugin
     {
-        _harmony = new Harmony("com.beefy.spt.controller");
-        _harmony.PatchAll();
-        Logger.LogInfo("[BeefyController] Loaded and patched.");
+        private Harmony _harmony;
+        internal static ManualLogSource Log;
+
+        private void Awake()
+        {
+            Log = Logger;
+            _harmony = new Harmony("com.beefy.spt.controller.ingame");
+            _harmony.PatchAll();
+            Log.LogInfo("[BeefyController] Controller plugin loaded (Amanda DEFAULT combat layout).");
+        }
+
+        private void OnDestroy()
+        {
+            _harmony?.UnpatchSelf();
+            Log?.LogInfo("[BeefyController] Controller plugin unloaded.");
+        }
     }
 
-    private void OnDestroy()
+    /// <summary>
+    /// Placeholder for future UI / looting handling.
+    /// </summary>
+    internal static class UiLootingController
     {
-        _harmony?.UnpatchSelf();
+        // TODO: implement cursor / inventory navigation here later.
     }
 
-    private static float ApplyDeadzone(float v, float dz)
+    [HarmonyPatch(typeof(InputManager), "method_3")]
+    internal static class InputManager_ControllerPatch
     {
-        if (Mathf.Abs(v) < dz) return 0f;
-        float n = (Mathf.Abs(v) - dz) / (1f - dz);
-        // cubic curve for fine aim near centre
-        n = n * n * n;
-        return Mathf.Sign(v) * Mathf.Clamp01(n);
-    }
+        private static Controller _controller = new Controller(UserIndex.One);
+        private static bool _connected = _controller.IsConnected;
+        private static State _prevState;
 
-    // ---------- HARMONY PATCH ----------
+        private const short DEADZONE = 8000;
+        private const float MAX_MAG = 32767f;
 
-    [HarmonyPatch(typeof(Class1728), nameof(Class1728.TranslateAxes))]
-    public static class Patch_TranslateAxes
-    {
-        // X button timing (reload / quick-reload / check ammo)
-        private const float DoubleTapWindow = 0.30f;
-        private const float HoldThreshold = 0.35f;
+        // trigger state
+        private static bool _rtHeld;
+        private static bool _ltHeld;
 
-        private static bool _xIsDown;
+        // sprint toggle state
+        private static bool _sprinting;
+
+        // tap / hold / double-tap timing
+        private const float HOLD_TIME = 0.35f;
+        private const float DOUBLE_TIME = 0.30f;
+
+        // B (crouch / prone)
+        private static float _bDownTime;
+        private static bool _bHoldSent;
+
+        // X (reload / check ammo / quick reload)
         private static float _xDownTime;
-        private static bool _xWaitingSecondTap;
-        private static float _xFirstTapTime;
-        private static bool _xPendingReload;   // single tap waiting to fire
+        private static float _xLastTapTime;
+        private static bool _xHoldSent;
+        private static bool _xDoubleReady;
 
-        // Y button timing (swap / examine)
-        private static bool _yIsDown;
+        // Y (quick swap / examine)
         private static float _yDownTime;
+        private static bool _yHoldSent;
 
-        static void Prefix(Class1728 __instance, ref float[] axes)
+        // R3 (quick melee / select melee)
+        private static float _r3DownTime;
+        private static bool _r3HoldSent;
+
+        // D-Pad Up (switch tac mode / toggle tac device)
+        private static float _upDownTime;
+        private static bool _upHoldSent;
+
+        // D-Pad Right (fire mode / check fire mode / force auto)
+        private static float _rightDownTime;
+        private static float _rightLastTapTime;
+        private static bool _rightHoldSent;
+        private static bool _rightDoubleReady;
+
+        // D-Pad Down (scope magnification / switch sights)
+        private static float _downDownTime;
+        private static bool _downHoldSent;
+
+        static void Prefix(List<ECommand> commandsList, float[] axesList)
+        {
+            // Reconnect if needed
+            if (!_connected || !_controller.IsConnected)
+            {
+                _controller = new Controller(UserIndex.One);
+                _connected = _controller.IsConnected;
+
+                if (!_connected)
+                    return;
+
+                BeefyControllerPlugin.Log?.LogInfo("[BeefyController] XInput controller connected.");
+            }
+
+            State state = _controller.GetState();
+            Gamepad gp = state.Gamepad;
+
+            // -------- AXES --------
+            HandleMovement(gp, axesList);
+            HandleLook(gp, axesList);
+
+            // -------- BUTTONS / COMMANDS --------
+            var cur = gp.Buttons;
+            var prev = _prevState.Gamepad.Buttons;
+
+            bool JustPressed(GamepadButtonFlags b) => cur.HasFlag(b) && !prev.HasFlag(b);
+            bool JustReleased(GamepadButtonFlags b) => !cur.HasFlag(b) && prev.HasFlag(b);
+
+            float now = Time.time;
+
+            // convenience flags so combos don't double-trigger
+            bool usedA = false, usedB = false, usedX = false, usedY = false;
+            bool usedUp = false, usedRight = false, usedDown = false;
+
+            // ===== FACE BUTTONS: Amanda DEFAULT =====
+
+            // --- A: Jump (simple tap) ---
+            if (JustPressed(GamepadButtonFlags.A))
+            {
+                commandsList.Add(ECommand.Jump);
+                usedA = true;
+            }
+
+            // --- B: tap = crouch, hold = prone ---
+            bool bNow = cur.HasFlag(GamepadButtonFlags.B);
+            bool bPrev = prev.HasFlag(GamepadButtonFlags.B);
+
+            if (bNow && !bPrev)
+            {
+                _bDownTime = now;
+                _bHoldSent = false;
+            }
+            if (bNow && !_bHoldSent && now - _bDownTime >= HOLD_TIME)
+            {
+                commandsList.Add(ECommand.ToggleProne);
+                _bHoldSent = true;
+            }
+            if (!bNow && bPrev)
+            {
+                if (!_bHoldSent)
+                    commandsList.Add(ECommand.ToggleDuck); // crouch toggle
+                usedB = true;
+            }
+
+            // --- X: tap = reload, hold = check ammo, double = quick reload ---
+            bool xNow = cur.HasFlag(GamepadButtonFlags.X);
+            bool xPrev = prev.HasFlag(GamepadButtonFlags.X);
+
+            if (xNow && !xPrev)
+            {
+                _xDownTime = now;
+                _xHoldSent = false;
+
+                // check for double-tap window
+                _xDoubleReady = (now - _xLastTapTime <= DOUBLE_TIME);
+            }
+            if (xNow && !_xHoldSent && now - _xDownTime >= HOLD_TIME)
+            {
+                // hold -> check ammo
+                commandsList.Add(ECommand.CheckAmmo);
+                _xHoldSent = true;
+            }
+            if (!xNow && xPrev)
+            {
+                if (_xDoubleReady && !_xHoldSent)
+                {
+                    // double tap -> quick reload
+                    commandsList.Add(ECommand.QuickReloadWeapon);
+                    _xDoubleReady = false;
+                }
+                else if (!_xHoldSent)
+                {
+                    // single tap -> normal reload
+                    commandsList.Add(ECommand.ReloadWeapon);
+                    _xLastTapTime = now;
+                }
+                usedX = true;
+            }
+
+            // --- Y: tap = quick swap weapon, hold = examine weapon ---
+            bool yNow = cur.HasFlag(GamepadButtonFlags.Y);
+            bool yPrev = prev.HasFlag(GamepadButtonFlags.Y);
+
+            if (yNow && !yPrev)
+            {
+                _yDownTime = now;
+                _yHoldSent = false;
+            }
+            if (yNow && !_yHoldSent && now - _yDownTime >= HOLD_TIME)
+            {
+                // hold -> examine weapon
+                commandsList.Add(ECommand.ExamineWeapon);
+                _yHoldSent = true;
+            }
+            if (!yNow && yPrev)
+            {
+                if (!_yHoldSent)
+                {
+                    // tap -> quick weapon swap
+                    commandsList.Add(ECommand.QuickSelectSecondaryWeapon);
+                }
+                usedY = true;
+            }
+
+            // ===== D-PAD: Tactical / Fire Mode / Optics =====
+
+            bool upNow = cur.HasFlag(GamepadButtonFlags.DPadUp);
+            bool upPrev = prev.HasFlag(GamepadButtonFlags.DPadUp);
+            bool rightNow = cur.HasFlag(GamepadButtonFlags.DPadRight);
+            bool rightPrev = prev.HasFlag(GamepadButtonFlags.DPadRight);
+            bool downNow = cur.HasFlag(GamepadButtonFlags.DPadDown);
+            bool downPrev = prev.HasFlag(GamepadButtonFlags.DPadDown);
+            bool leftNow = cur.HasFlag(GamepadButtonFlags.DPadLeft);
+            bool leftPrev = prev.HasFlag(GamepadButtonFlags.DPadLeft);
+
+            // --- Up: tap = switch tactical device mode, hold = toggle tactical device ---
+            if (upNow && !upPrev)
+            {
+                _upDownTime = now;
+                _upHoldSent = false;
+            }
+            if (upNow && !_upHoldSent && now - _upDownTime >= HOLD_TIME)
+            {
+                commandsList.Add(ECommand.ToggleTacticalDevice);
+                _upHoldSent = true;
+            }
+            if (!upNow && upPrev)
+            {
+                if (!_upHoldSent)
+                    commandsList.Add(ECommand.NextTacticalDevice);
+                usedUp = true;
+            }
+
+            // --- Right: tap = change fire mode, hold = check fire mode, double = force auto ---
+            if (rightNow && !rightPrev)
+            {
+                _rightDownTime = now;
+                _rightHoldSent = false;
+                _rightDoubleReady = (now - _rightLastTapTime <= DOUBLE_TIME);
+            }
+            if (rightNow && !_rightHoldSent && now - _rightDownTime >= HOLD_TIME)
+            {
+                commandsList.Add(ECommand.CheckFireMode);
+                _rightHoldSent = true;
+            }
+            if (!rightNow && rightPrev)
+            {
+                if (_rightDoubleReady && !_rightHoldSent)
+                {
+                    commandsList.Add(ECommand.ForceAutoWeaponMode);
+                    _rightDoubleReady = false;
+                }
+                else if (!_rightHoldSent)
+                {
+                    commandsList.Add(ECommand.ChangeWeaponMode);
+                    _rightLastTapTime = now;
+                }
+                usedRight = true;
+            }
+
+            // --- Down: tap = change scope magnification, hold = switch sights ---
+            if (downNow && !downPrev)
+            {
+                _downDownTime = now;
+                _downHoldSent = false;
+            }
+            if (downNow && !_downHoldSent && now - _downDownTime >= HOLD_TIME)
+            {
+                commandsList.Add(ECommand.ChangeScope);
+                _downHoldSent = true;
+            }
+            if (!downNow && downPrev)
+            {
+                if (!_downHoldSent)
+                    commandsList.Add(ECommand.ChangeScopeMagnification);
+                usedDown = true;
+            }
+
+            // --- Left: extra quick sight toggle (simple) ---
+            if (leftNow && !leftPrev)
+            {
+                commandsList.Add(ECommand.ChangeScope);
+            }
+
+            // ===== LB / RB: Lean (continuous) =====
+            if (JustPressed(GamepadButtonFlags.LeftShoulder))
+                commandsList.Add(ECommand.ToggleLeanLeft);
+            if (JustReleased(GamepadButtonFlags.LeftShoulder))
+                commandsList.Add(ECommand.EndLeanLeft);
+
+            if (JustPressed(GamepadButtonFlags.RightShoulder))
+                commandsList.Add(ECommand.ToggleLeanRight);
+            if (JustReleased(GamepadButtonFlags.RightShoulder))
+                commandsList.Add(ECommand.EndLeanRight);
+
+            // ===== L3: Sprint TOGGLE (click) =====
+            if (JustPressed(GamepadButtonFlags.LeftThumb))
+            {
+                if (!_sprinting)
+                {
+                    commandsList.Add(ECommand.ToggleSprinting);
+                    _sprinting = true;
+                }
+                else
+                {
+                    commandsList.Add(ECommand.EndSprinting);
+                    _sprinting = false;
+                }
+            }
+
+            // ===== R3: tap = quick melee, hold = select melee =====
+            bool r3Now = cur.HasFlag(GamepadButtonFlags.RightThumb);
+            bool r3Prev = prev.HasFlag(GamepadButtonFlags.RightThumb);
+
+            if (r3Now && !r3Prev)
+            {
+                _r3DownTime = now;
+                _r3HoldSent = false;
+            }
+            if (r3Now && !_r3HoldSent && now - _r3DownTime >= HOLD_TIME)
+            {
+                commandsList.Add(ECommand.SelectKnife);
+                _r3HoldSent = true;
+            }
+            if (!r3Now && r3Prev)
+            {
+                if (!_r3HoldSent)
+                    commandsList.Add(ECommand.QuickKnifeKick);
+            }
+
+            // ===== Start / Back =====
+            if (JustPressed(GamepadButtonFlags.Back))
+                commandsList.Add(ECommand.ToggleInventory);
+
+            if (JustPressed(GamepadButtonFlags.Start))
+                commandsList.Add(ECommand.Escape);
+
+            // ===== Triggers: fire / aim (hold) =====
+            bool fire = gp.RightTrigger > 30;
+            bool aim = gp.LeftTrigger > 30;
+
+            if (fire && !_rtHeld)
+                commandsList.Add(ECommand.ToggleShooting);
+            if (!fire && _rtHeld)
+                commandsList.Add(ECommand.EndShooting);
+            _rtHeld = fire;
+
+            if (aim && !_ltHeld)
+                commandsList.Add(ECommand.ToggleAlternativeShooting);
+            if (!aim && _ltHeld)
+                commandsList.Add(ECommand.EndAlternativeShooting);
+            _ltHeld = aim;
+
+            _prevState = state;
+        }
+
+        // ---------- MOVEMENT (LS) ----------
+        private static void HandleMovement(Gamepad gp, float[] axes)
         {
             if (axes == null || axes.Length < 7)
                 return;
 
-            float now = Time.unscaledTime;
+            float lx = gp.LeftThumbX;
+            float ly = gp.LeftThumbY;
 
-            // =======================
-            // LEFT STICK – movement
-            // =======================
-            float rawLX = Input.GetAxis("Horizontal");
-            float rawLY = Input.GetAxis("Vertical");
+            Vector2 raw = new Vector2(lx, ly);
+            float mag = raw.magnitude;
 
-            float moveX = ApplyDeadzone(rawLX, MoveDeadzone) * MoveSensitivity;
-            float moveY = ApplyDeadzone(rawLY, MoveDeadzone) * MoveSensitivity;
-
-            axes[0] = moveX;
-            axes[1] = moveY;
-
-            // =======================
-            // RIGHT STICK – look
-            // =======================
-            float rawRX = Input.GetAxis("Mouse X"); // your working axes from before
-            float rawRY = Input.GetAxis("Mouse Y");
-
-            float lookX = ApplyDeadzone(rawRX, LookDeadzone) * LookBaseSensitivity;
-            float lookY = ApplyDeadzone(rawRY, LookDeadzone) * LookBaseSensitivity * LookVerticalScale;
-
-            axes[2] = lookX;
-            axes[3] = lookY;
-
-            axes[4] = 0f;
-            axes[5] = 0f;
-            axes[6] = 0f;
-
-            // ================
-            // BUTTON LOGIC
-            // ================
-
-            try
+            if (mag < DEADZONE)
             {
-                // ----- A : jump -----
-                if (Input.GetKeyDown(KeyCode.JoystickButton0))
-                    __instance.TranslateCommand(ECommand.Jump);
-
-                // ----- B : crouch / prone (hold) -----
-                if (Input.GetKeyDown(KeyCode.JoystickButton1))
-                    __instance.TranslateCommand(ECommand.ToggleDuck);
-                if (Input.GetKey(KeyCode.JoystickButton1) &&
-                    !Input.GetKey(KeyCode.JoystickButton0)) // avoid spam if mashing
-                {
-                    // optional: after holding B for a while go prone
-                    // tweak threshold if you want this
-                }
-
-                // ----- X : reload / check ammo / quick reload -----
-                bool xDown = Input.GetKeyDown(KeyCode.JoystickButton2);
-                bool xUp = Input.GetKeyUp(KeyCode.JoystickButton2);
-
-                if (xDown)
-                {
-                    if (!_xIsDown)
-                    {
-                        _xIsDown = true;
-                        _xDownTime = now;
-
-                        // second tap within window => QUICK RELOAD immediately
-                        if (_xWaitingSecondTap && (now - _xFirstTapTime) <= DoubleTapWindow)
-                        {
-                            _xWaitingSecondTap = false;
-                            _xPendingReload = false; // cancel normal reload
-                            __instance.TranslateCommand(ECommand.QuickReloadWeapon);
-                        }
-                    }
-                }
-
-                if (xUp && _xIsDown)
-                {
-                    _xIsDown = false;
-                    float held = now - _xDownTime;
-
-                    if (held >= HoldThreshold)
-                    {
-                        // HOLD X => Check ammo
-                        __instance.TranslateCommand(ECommand.CheckAmmo);
-                        _xWaitingSecondTap = false;
-                        _xPendingReload = false;
-                    }
-                    else
-                    {
-                        // short tap – maybe reload or part of double tap
-                        _xWaitingSecondTap = true;
-                        _xFirstTapTime = now;
-                        _xPendingReload = true;
-                    }
-                }
-
-                // timer to resolve single-tap reload if second tap never comes
-                if (_xWaitingSecondTap && _xPendingReload &&
-                    (now - _xFirstTapTime) > DoubleTapWindow)
-                {
-                    _xWaitingSecondTap = false;
-                    _xPendingReload = false;
-                    __instance.TranslateCommand(ECommand.ReloadWeapon);
-                }
-
-                // ----- Y : quick swap / examine (hold) -----
-                bool yDown = Input.GetKeyDown(KeyCode.JoystickButton3);
-                bool yUp = Input.GetKeyUp(KeyCode.JoystickButton3);
-
-                if (yDown && !_yIsDown)
-                {
-                    _yIsDown = true;
-                    _yDownTime = now;
-                }
-
-                if (yUp && _yIsDown)
-                {
-                    _yIsDown = false;
-                    float held = now - _yDownTime;
-
-                    if (held >= HoldThreshold)
-                    {
-                        // HOLD Y => examine weapon
-                        __instance.TranslateCommand(ECommand.ExamineWeapon);
-                    }
-                    else
-                    {
-                        // TAP Y => quick swap weapon
-                        __instance.TranslateCommand(ECommand.QuickSelectSecondaryWeapon);
-                    }
-                }
-
-                // ----- LB : hold to lean left -----
-                if (Input.GetKeyDown(KeyCode.JoystickButton4))
-                    __instance.TranslateCommand(ECommand.ToggleLeanLeft);
-                if (Input.GetKeyUp(KeyCode.JoystickButton4))
-                    __instance.TranslateCommand(ECommand.EndLeanLeft);
-
-                // ----- RB : hold to lean right -----
-                if (Input.GetKeyDown(KeyCode.JoystickButton5))
-                    __instance.TranslateCommand(ECommand.ToggleLeanRight);
-                if (Input.GetKeyUp(KeyCode.JoystickButton5))
-                    __instance.TranslateCommand(ECommand.EndLeanRight);
-
-                // ----- LT : aim (hold) -----
-                if (Input.GetAxis("LT") > 0.5f) // or however you read LT
-                    __instance.TranslateCommand(ECommand.ToggleAlternativeShooting);
-                else
-                    __instance.TranslateCommand(ECommand.EndAlternativeShooting);
-
-                // ----- RT : fire -----
-                if (Input.GetAxis("RT") > 0.5f)
-                    __instance.TranslateCommand(ECommand.ToggleShooting);
-                else
-                    __instance.TranslateCommand(ECommand.EndShooting);
-
-                // ----- L3 : sprint toggle (click once to toggle) -----
-                if (Input.GetKeyDown(KeyCode.JoystickButton8))
-                    __instance.TranslateCommand(ECommand.ToggleSprinting);
-
-                // ----- R3 : check chamber (you can change to CheckAmmo if you prefer) -----
-                if (Input.GetKeyDown(KeyCode.JoystickButton9))
-                    __instance.TranslateCommand(ECommand.CheckChamber);
+                axes[(int)EAxis.MoveX] = 0f;
+                axes[(int)EAxis.MoveY] = 0f;
+                return;
             }
-            catch (Exception ex)
-            {
-#if DEBUG
-                Debug.LogWarning("[BeefyController] Exception in TranslateAxes patch: " + ex);
-#endif
-            }
+
+            float t = (mag - DEADZONE) / (MAX_MAG - DEADZONE);
+            t = Mathf.Clamp01(t);
+
+            Vector2 dir = raw / mag;
+            Vector2 final = dir * t;
+
+            axes[(int)EAxis.MoveX] = final.x;
+            axes[(int)EAxis.MoveY] = final.y;
         }
 
-        // helper so we can call static from nested class
-        private static float ApplyDeadzone(float v, float dz) => BeefyControllerClass.ApplyDeadzone(v, dz);
+        // ---------- LOOK (RS) ----------
+        private static void HandleLook(Gamepad gp, float[] axes)
+        {
+            if (axes == null || axes.Length < 7)
+                return;
+
+            float rx = gp.RightThumbX;
+            float ry = gp.RightThumbY;
+
+            const float LOOK_DEADZONE = 4000f;
+            const float LOOK_SCALE_X = 4f;   // horizontal sensitivity
+            const float LOOK_SCALE_Y = 3f;   // vertical sensitivity (lower)
+
+            Vector2 raw = new Vector2(rx, ry);
+            float mag = raw.magnitude;
+
+            if (mag < LOOK_DEADZONE)
+            {
+                axes[(int)EAxis.TurnX] = 0f;
+                axes[(int)EAxis.TurnY] = 0f;
+                return;
+            }
+
+            // 0..1 outside deadzone
+            float t = (mag - LOOK_DEADZONE) / (MAX_MAG - LOOK_DEADZONE);
+            t = Mathf.Clamp01(t);
+
+            // acceleration curve
+            float tCurve = t * t;
+
+            Vector2 dir = raw / mag;
+
+            // apply different scale for X vs Y
+            float finalX = dir.x * tCurve * LOOK_SCALE_X;
+            float finalY = dir.y * tCurve * LOOK_SCALE_Y;
+
+            axes[(int)EAxis.TurnX] = finalX;
+            axes[(int)EAxis.TurnY] = -finalY; // invert so up on stick = look up
+        }
+
     }
 }
